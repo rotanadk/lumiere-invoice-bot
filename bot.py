@@ -2,27 +2,21 @@ import logging
 import os
 import tempfile
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update
 from telegram.constants import ChatType, ParseMode
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from db import (
     create_order,
+    get_invoice_topic,
     get_order,
-    get_setup,
+    get_order_topic,
     init_db,
     mark_order,
     next_invoice_no,
-    save_setup,
-    set_preview_message,
-    update_order,
+    save_invoice_topic,
+    save_order_topic,
+    source_message_exists,
 )
 from invoice import create_invoice
 from parser import parse_order
@@ -34,35 +28,6 @@ logging.basicConfig(
 log = logging.getLogger("lumiere_invoice_bot")
 
 
-def preview_text(order):
-    lines = ["🧾 <b>Invoice preview</b>"]
-    if order.get("order_no"):
-        lines.append(f"Order: <b>#{order['order_no']}</b>")
-    lines.append(f"Customer: <b>{order['customer']}</b>")
-    lines.append("")
-    total = 0.0
-    for item in order["items"]:
-        total += float(item["amount"])
-        lines.append(
-            f"• <b>{item['product']}</b> — {item['qty_display']} × ${item['unit_price']:.2f} = <b>${item['amount']:.2f}</b>"
-        )
-    lines.append("")
-    lines.append(f"Payment: <b>{order.get('payment_status') or 'Unpaid'}</b>" +
-                 (f" ({order['payment_method']})" if order.get("payment_method") else ""))
-    lines.append(f"Total: <b>${total:.2f}</b>")
-    lines.append("")
-    lines.append("Check the details before generating the PDF.")
-    return "\n".join(lines)
-
-
-def buttons(order_id):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Generate Invoice", callback_data=f"gen:{order_id}")],
-        [InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{order_id}"),
-         InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{order_id}")],
-    ])
-
-
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
     return member.status in ("administrator", "creator")
@@ -71,31 +36,59 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == ChatType.PRIVATE:
         await update.message.reply_text(
-            "Lumiere Invoice Bot is ready. Add me to your Telegram group, make me admin, "
-            "then open the Drop Order topic and send /setup."
+            "Lumiere Invoice Bot is ready.\n\n"
+            "1) In the Drop Order topic send /setup_orders\n"
+            "2) In the Invoice topic send /setup_invoices\n\n"
+            "After that, new orders are converted to PDF invoices automatically."
         )
 
 
-async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _validate_topic_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await msg.reply_text("Please use /setup inside your Telegram group topic.")
-        return
+        await msg.reply_text("Please use this command inside a Telegram group topic.")
+        return None
     if not await is_admin(update, context):
-        await msg.reply_text("Only a group admin can run /setup.")
-        return
-    topic_id = msg.message_thread_id
-    if not topic_id:
-        await msg.reply_text("Please open the Drop Order topic and send /setup inside that topic.")
-        return
+        await msg.reply_text("Only a group admin can run this setup command.")
+        return None
+    if not msg.message_thread_id:
+        await msg.reply_text("Please run this command inside a topic, not the main group chat.")
+        return None
+    return msg
 
-    save_setup(update.effective_chat.id, topic_id)
+
+async def setup_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await _validate_topic_setup(update, context)
+    if not msg:
+        return
+    save_order_topic(update.effective_chat.id, msg.message_thread_id)
     await msg.reply_text(
-        "✅ <b>Lumiere Invoice Bot connected.</b>\n\n"
-        "I will only read order messages in this topic.\n"
-        "Example:\n<code>37: Prime : LV55 10kg (14.5$)</code>",
+        "✅ <b>Order topic connected.</b>\n"
+        "New valid orders posted here will be converted automatically.\n"
+        "The bot will not post invoice previews in this topic.",
         parse_mode=ParseMode.HTML,
     )
+
+
+# Keep /setup working as an alias for the source order topic.
+async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await setup_orders(update, context)
+
+
+async def setup_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await _validate_topic_setup(update, context)
+    if not msg:
+        return
+    save_invoice_topic(update.effective_chat.id, msg.message_thread_id)
+    await msg.reply_text(
+        "✅ <b>Invoice topic connected.</b>\n"
+        "Automatically generated PDF invoices will be sent to this topic.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+def order_total(order):
+    return sum(float(item["amount"]) for item in order["items"])
 
 
 async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,46 +96,39 @@ async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.text or msg.text.startswith("/"):
         return
 
-    setup_value = get_setup()
-    if not setup_value:
-        return
-    configured_chat, configured_topic = setup_value
-    if update.effective_chat.id != configured_chat or msg.message_thread_id != configured_topic:
+    source = get_order_topic()
+    destination = get_invoice_topic()
+    if not source or not destination:
         return
 
-    # If this user is currently editing an order, replace that pending order.
-    editing_order_id = context.user_data.pop("editing_order_id", None)
+    source_chat, source_topic = source
+    if update.effective_chat.id != source_chat or msg.message_thread_id != source_topic:
+        return
+
+    # Avoid duplicate invoices if Telegram retries an update or Railway restarts.
+    if source_message_exists(update.effective_chat.id, msg.message_thread_id, msg.message_id):
+        return
+
+    dest_chat, dest_topic = destination
+
     try:
         parsed = parse_order(msg.text)
     except ValueError as e:
-        if editing_order_id:
-            context.user_data["editing_order_id"] = editing_order_id
-        await msg.reply_text(
-            "⚠️ I couldn't read this order yet.\n"
-            f"{e}\n\n"
-            "Try this format:\n"
-            "<code>37: Prime : LV55 10kg (14.5$)</code>\n\n"
-            "For multiple items, put one item on each line.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    if editing_order_id:
-        update_order(editing_order_id, parsed, msg.text)
-        order = get_order(editing_order_id)
-        preview_id = order.get("preview_message_id")
-        if preview_id:
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=order["telegram_chat_id"],
-                    message_id=preview_id,
-                    text=preview_text(order),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=buttons(editing_order_id),
-                )
-            except Exception:
-                pass
-        await msg.reply_text("✅ Order updated. Check the invoice preview above.")
+        # Keep Drop Order clean. Put parsing problems in the invoice topic instead.
+        try:
+            await context.bot.send_message(
+                chat_id=dest_chat,
+                message_thread_id=dest_topic,
+                text=(
+                    "⚠️ <b>Invoice not generated</b>\n"
+                    f"I couldn't understand order message #{msg.message_id}.\n"
+                    f"Reason: {e}\n\n"
+                    f"<code>{msg.text[:1200]}</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            log.exception("Could not report parsing error to invoice topic")
         return
 
     order_id = create_order(
@@ -151,59 +137,39 @@ async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg.message_id,
         parsed,
         msg.text,
-        update.effective_user.id,
+        update.effective_user.id if update.effective_user else None,
     )
     order = get_order(order_id)
-    preview = await msg.reply_text(
-        preview_text(order),
-        parse_mode=ParseMode.HTML,
-        reply_markup=buttons(order_id),
-    )
-    set_preview_message(order_id, preview.message_id)
 
+    invoice_no = next_invoice_no(order.get("order_no"))
+    tmp_dir = tempfile.mkdtemp(prefix="lumiere_invoice_")
+    filename = f"Lumiere_Invoice_{invoice_no}.pdf"
+    path = os.path.join(tmp_dir, filename)
 
-async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    action, order_id_s = q.data.split(":", 1)
-    order_id = int(order_id_s)
-    order = get_order(order_id)
-    if not order:
-        await q.edit_message_text("This order no longer exists.")
-        return
-
-    if action == "cancel":
-        mark_order(order_id, "cancelled")
-        await q.edit_message_text("❌ Invoice cancelled.")
-        return
-
-    if action == "edit":
-        context.user_data["editing_order_id"] = order_id
-        await q.message.reply_text(
-            "✏️ Send the corrected order text now in this same topic.\n"
-            "I will update this invoice preview instead of creating a new one."
-        )
-        return
-
-    if action == "gen":
-        invoice_no = next_invoice_no(order.get("order_no"))
-        tmp_dir = tempfile.mkdtemp(prefix="lumiere_invoice_")
-        filename = f"Lumiere_Invoice_{invoice_no}.pdf"
-        path = os.path.join(tmp_dir, filename)
+    try:
         create_invoice(order, invoice_no, path)
-
+        total = order_total(order)
         with open(path, "rb") as f:
             await context.bot.send_document(
-                chat_id=order["telegram_chat_id"],
-                message_thread_id=order["topic_id"],
+                chat_id=dest_chat,
+                message_thread_id=dest_topic,
                 document=f,
                 filename=filename,
-                caption=f"✅ Invoice #{invoice_no} — {order['customer']}",
-                reply_to_message_id=order.get("source_message_id"),
+                caption=(
+                    f"🧾 Invoice #{invoice_no} — {order['customer']}\n"
+                    f"Total: ${total:,.2f}"
+                ),
             )
         mark_order(order_id, "generated", invoice_no)
+    except Exception:
+        mark_order(order_id, "failed")
+        log.exception("Invoice generation failed for order_id=%s", order_id)
         try:
-            await q.edit_message_reply_markup(reply_markup=None)
+            await context.bot.send_message(
+                chat_id=dest_chat,
+                message_thread_id=dest_topic,
+                text=f"❌ Failed to generate Invoice #{invoice_no}. Check Railway logs.",
+            )
         except Exception:
             pass
 
@@ -221,11 +187,12 @@ def main():
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setup", setup))
-    app.add_handler(CallbackQueryHandler(callback, pattern=r"^(gen|edit|cancel):\d+$"))
+    app.add_handler(CommandHandler("setup_orders", setup_orders))
+    app.add_handler(CommandHandler("setup_invoices", setup_invoices))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_order))
     app.add_error_handler(error_handler)
 
-    log.info("Starting Lumiere Invoice Bot with long polling...")
+    log.info("Starting Lumiere Invoice Bot in AUTO mode with long polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

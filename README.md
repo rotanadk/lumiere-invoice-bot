@@ -1,58 +1,49 @@
-# Lumiere Invoice Telegram Bot
+# Lumiere Invoice Bot — Auto Invoice Mode
 
-This bot watches one Telegram forum topic (your **Drop Order** topic), reads order messages, shows a confirmation preview, and generates the approved Lumiere Coffee Roastery PDF invoice with your payment QR code.
+This version keeps the **Drop Order** topic clean.
 
-## Supported example
+## Workflow
 
-```text
-37: Prime : LV55 10kg (14.5$)
-```
+1. Staff posts a normal order in the **Drop Order** topic.
+2. The bot silently reads and parses it.
+3. The bot immediately generates the approved Lumiere PDF invoice.
+4. The PDF is sent automatically to a separate **Invoice** topic.
+5. No preview/buttons are posted in Drop Order.
 
-Multiple products:
+Example order:
 
-```text
-38: ABC Coffee
-LV55 5kg (14.5$)
-BV55 10kg (16$)
-Paid by cash
-```
+`37: Prime : LV55 10kg (14.5$)`
 
-Buy-10-get-1 style quantity is also supported:
+Result: Invoice #37, total $145.00.
 
-```text
-39: Customer Name : BV55 10+1kg (16$)
-```
+## Railway variables
 
-The invoice displays `10+1 kg`, but charges only the first `10 kg`.
+- `BOT_TOKEN` = your BotFather token
+- `DATA_DIR` = `/data`
+- `TZ` = `Asia/Phnom_Penh`
 
-For grams, the price is treated as price per kg. Example: `Colombia Cookies 200g (65$)` becomes 0.2 × $65 = $13.
+Use a Railway persistent volume mounted at `/data`.
 
-## Railway deployment
+## Telegram setup
 
-1. Create a new GitHub repository.
-2. Upload every file/folder from this project to the repository. Keep the `assets` folder.
-3. In Railway, create a new project from that GitHub repository.
-4. In Railway **Variables**, add:
-   - `BOT_TOKEN` = the token from @BotFather
-   - `DATA_DIR` = `/data`
-   - `TZ` = `Asia/Phnom_Penh`
-5. Add a Railway Volume and mount it at `/data` so your setup and invoice records survive redeploys.
-6. Deploy. The included `railway.json` starts the bot with `python bot.py`.
-7. In Telegram, open your **Drop Order** topic and send:
+After deploying this version:
 
-```text
-/setup
-```
+### Source topic
+Open **Drop Order** and send:
 
-The bot will save that group ID and topic ID automatically.
+`/setup_orders`
 
-## Normal workflow
+(`/setup` is also accepted for backward compatibility.)
 
-1. Staff posts an order in Drop Order.
-2. Bot replies with invoice preview.
-3. Tap **Generate Invoice**, **Edit**, or **Cancel**.
-4. Generate Invoice sends the PDF into the same topic.
+### Destination topic
+Create/open a separate topic such as **Invoices** and send:
 
-## Security
+`/setup_invoices`
 
-Never put your real BotFather token in GitHub or in any file. Put it only in Railway Variables as `BOT_TOKEN`.
+After both commands succeed, new orders are processed automatically.
+
+## Notes
+
+- Valid orders create invoices silently in the destination topic.
+- If an order cannot be parsed, the error is posted to the Invoice topic, not Drop Order.
+- The bot stores processed source message IDs so a restart/retry does not create duplicate invoices for the same Telegram message.

@@ -61,17 +61,40 @@ def get_setting(key, default=None):
     return row["value"] if row else default
 
 
-def save_setup(chat_id, topic_id):
-    set_setting("chat_id", chat_id)
-    set_setting("topic_id", topic_id)
+def save_order_topic(chat_id, topic_id):
+    set_setting("order_chat_id", chat_id)
+    set_setting("order_topic_id", topic_id)
 
 
-def get_setup():
-    chat_id = get_setting("chat_id")
-    topic_id = get_setting("topic_id")
+def save_invoice_topic(chat_id, topic_id):
+    set_setting("invoice_chat_id", chat_id)
+    set_setting("invoice_topic_id", topic_id)
+
+
+def get_order_topic():
+    # Backward compatibility with the previous /setup version.
+    chat_id = get_setting("order_chat_id") or get_setting("chat_id")
+    topic_id = get_setting("order_topic_id") or get_setting("topic_id")
     if not chat_id or not topic_id:
         return None
     return int(chat_id), int(topic_id)
+
+
+def get_invoice_topic():
+    chat_id = get_setting("invoice_chat_id")
+    topic_id = get_setting("invoice_topic_id")
+    if not chat_id or not topic_id:
+        return None
+    return int(chat_id), int(topic_id)
+
+
+def source_message_exists(chat_id, topic_id, source_message_id):
+    with connect() as con:
+        row = con.execute(
+            "SELECT 1 FROM orders WHERE telegram_chat_id=? AND topic_id=? AND source_message_id=? LIMIT 1",
+            (chat_id, topic_id, source_message_id),
+        ).fetchone()
+    return bool(row)
 
 
 def create_order(chat_id, topic_id, source_message_id, parsed, raw_text, created_by):
@@ -94,27 +117,6 @@ def create_order(chat_id, topic_id, source_message_id, parsed, raw_text, created
         return cur.lastrowid
 
 
-def update_order(order_id, parsed, raw_text):
-    with connect() as con:
-        con.execute(
-            """
-            UPDATE orders SET order_no=?, customer=?, raw_text=?, items_json=?,
-                payment_status=?, payment_method=?, status='pending'
-            WHERE id=?
-            """,
-            (
-                parsed.get("order_no"), parsed["customer"], raw_text,
-                json.dumps(parsed["items"]), parsed.get("payment_status", "Unpaid"),
-                parsed.get("payment_method", ""), order_id,
-            ),
-        )
-
-
-def set_preview_message(order_id, preview_message_id):
-    with connect() as con:
-        con.execute("UPDATE orders SET preview_message_id=? WHERE id=?", (preview_message_id, order_id))
-
-
 def get_order(order_id):
     with connect() as con:
         row = con.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
@@ -130,7 +132,10 @@ def mark_order(order_id, status, invoice_no=None):
         if invoice_no is None:
             con.execute("UPDATE orders SET status=? WHERE id=?", (status, order_id))
         else:
-            con.execute("UPDATE orders SET status=?, invoice_no=? WHERE id=?", (status, invoice_no, order_id))
+            con.execute(
+                "UPDATE orders SET status=?, invoice_no=? WHERE id=?",
+                (status, invoice_no, order_id),
+            )
 
 
 def next_invoice_no(preferred=None):
