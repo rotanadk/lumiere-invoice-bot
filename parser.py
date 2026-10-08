@@ -5,7 +5,6 @@ PAYMENT_RE = re.compile(r"\bpaid\s+by\s+(.+)$", re.I)
 PAID_RE = re.compile(r"\bpaid\b", re.I)
 UNPAID_RE = re.compile(r"\bunpaid\b", re.I)
 
-# Product name + quantity + unit + price in parentheses.
 ITEM_RE = re.compile(
     r"^\s*(?P<product>.+?)\s+"
     r"(?P<qty>\d+(?:\.\d+)?(?:\s*\+\s*\d+(?:\.\d+)?)?)\s*"
@@ -22,6 +21,15 @@ def _to_decimal(s):
         return Decimal("0")
 
 
+def _split_item_entries(text):
+    # Supports:
+    # LV55 10kg (14$); BV55 5kg (16$)
+    # LV55 10kg (14$), BV55 5kg (16$)
+    # LV55 10kg (14$) and BV55 5kg (16$)
+    parts = re.split(r"\s*;\s*|\s*,\s*|\s+(?:and|&)\s+", text, flags=re.I)
+    return [p.strip() for p in parts if p.strip()]
+
+
 def _normalize_qty(qty_raw, unit_raw):
     qty_raw = re.sub(r"\s+", "", qty_raw)
     unit = (unit_raw or "kg").lower()
@@ -30,17 +38,23 @@ def _normalize_qty(qty_raw, unit_raw):
     if unit in ("gram", "grams"):
         unit = "g"
 
-    bonus = Decimal("0")
     if "+" in qty_raw:
         base_s, bonus_s = qty_raw.split("+", 1)
         base = _to_decimal(base_s)
         bonus = _to_decimal(bonus_s)
     else:
         base = _to_decimal(qty_raw)
+        bonus = Decimal("0")
 
-    charged_qty_kg = base / Decimal("1000") if unit == "g" else base
+    if unit == "g":
+        charged_qty_kg = base / Decimal("1000")
+        physical_qty_kg = (base + bonus) / Decimal("1000")
+    else:
+        charged_qty_kg = base
+        physical_qty_kg = base + bonus
+
     display = f"{qty_raw} {unit}"
-    return display, charged_qty_kg, bonus
+    return display, qty_raw, unit, charged_qty_kg, bonus, physical_qty_kg
 
 
 def parse_order(text):
@@ -58,23 +72,30 @@ def parse_order(text):
     payment_method = ""
 
     first = raw_lines[0]
+
     # Examples:
     # 37: Prime : LV55 10kg (14.5$)
+    # 45: Arata: LV55 10kg (14$), BV55 5kg (16$)
     # 33: walk-in
     m = re.match(r"^\s*(\d+)\s*:\s*([^:]+?)(?:\s*:\s*(.+))?$", first)
     if m:
         order_no = m.group(1).strip()
         customer = m.group(2).strip()
         if m.group(3):
-            item_lines.append(m.group(3).strip())
+            item_lines.extend(_split_item_entries(m.group(3).strip()))
         rest = raw_lines[1:]
     else:
         # Also support: Prime : LV55 10kg (14.5$)
         m2 = re.match(r"^\s*([^:]+?)\s*:\s*(.+)$", first)
-        if m2 and ITEM_RE.match(m2.group(2).strip()):
-            customer = m2.group(1).strip()
-            item_lines.append(m2.group(2).strip())
-            rest = raw_lines[1:]
+        if m2:
+            candidate_items = _split_item_entries(m2.group(2).strip())
+            if candidate_items and all(ITEM_RE.match(x) for x in candidate_items):
+                customer = m2.group(1).strip()
+                item_lines.extend(candidate_items)
+                rest = raw_lines[1:]
+            else:
+                customer = first.strip(" :")
+                rest = raw_lines[1:]
         else:
             # Fallback: first line is customer, following lines are items.
             customer = first.strip(" :")
@@ -92,8 +113,8 @@ def parse_order(text):
         if PAID_RE.search(line) and not ITEM_RE.match(line):
             payment_status = "Paid"
             continue
-        # Allow semicolon-separated item entries.
-        item_lines.extend([x.strip() for x in line.split(";") if x.strip()])
+
+        item_lines.extend(_split_item_entries(line))
 
     items = []
     unparsed = []
@@ -103,14 +124,20 @@ def parse_order(text):
             unparsed.append(line)
             continue
 
-        qty_display, charged_qty_kg, bonus = _normalize_qty(im.group("qty"), im.group("unit"))
+        qty_display, qty_raw, unit, charged_qty_kg, bonus, physical_qty_kg = _normalize_qty(
+            im.group("qty"), im.group("unit")
+        )
         unit_price = _to_decimal(im.group("price"))
         amount = (charged_qty_kg * unit_price).quantize(Decimal("0.01"))
+
         items.append({
             "product": im.group("product").strip(),
             "qty_display": qty_display,
+            "qty": qty_raw,
+            "unit": unit,
             "charged_qty": float(charged_qty_kg),
             "bonus_qty": float(bonus),
+            "physical_qty_kg": float(physical_qty_kg),
             "unit_price": float(unit_price),
             "amount": float(amount),
         })

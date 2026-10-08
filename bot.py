@@ -20,6 +20,7 @@ from db import (
 )
 from invoice import create_invoice
 from parser import parse_order
+from sheets import sync_order_to_sheets
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -130,6 +131,28 @@ async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             log.exception("Could not report parsing error to invoice topic")
         return
+
+    # Save every parsed transaction to Google Sheets.
+    # If the Sheet sync fails, keep Drop Order clean and report only in Invoice topic.
+    try:
+        sheet_result = await sync_order_to_sheets(msg, parsed, update.effective_user)
+        if sheet_result.get("disabled"):
+            log.warning("Order parsed, but Google Sheets integration is not configured yet.")
+    except Exception as e:
+        log.exception("Google Sheets sync failed for message_id=%s", msg.message_id)
+        try:
+            await context.bot.send_message(
+                chat_id=dest_chat,
+                message_thread_id=dest_topic,
+                text=(
+                    "⚠️ <b>Google Sheet not updated</b>\n"
+                    f"Order message #{msg.message_id} was parsed, and the invoice will still be generated.\n"
+                    f"Reason: <code>{str(e)[:700]}</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
     order_id = create_order(
         update.effective_chat.id,
